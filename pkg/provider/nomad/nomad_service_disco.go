@@ -7,9 +7,11 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/nomad/api"
 	types2 "github.com/traefik/paerser/types"
 	"github.com/traefik/traefik/v2/pkg/config/dynamic"
+	"github.com/traefik/traefik/v2/pkg/job"
 	"github.com/traefik/traefik/v2/pkg/log"
 	"github.com/traefik/traefik/v2/pkg/provider"
 	"github.com/traefik/traefik/v2/pkg/provider/constraints"
@@ -53,14 +55,9 @@ type Provider struct {
 	ExposedByDefault bool            `description:"Expose Nomad services by default." json:"exposedByDefault,omitempty" toml:"exposedByDefault,omitempty" yaml:"exposedByDefault,omitempty" export:"true"`
 	RefreshInterval  types2.Duration `description:"Interval for polling Nomad API. Default 15s" json:"refreshInterval,omitempty" toml:"refreshInterval,omitempty" yaml:"refreshInterval,omitempty" export:"true"`
 
-	// RequireConsistent bool            `description:"Forces the read to be fully consistent." json:"requireConsistent,omitempty" toml:"requireConsistent,omitempty" yaml:"requireConsistent,omitempty" export:"true"`
-	// Cache             bool            `description:"Use local agent caching for catalog reads." json:"cache,omitempty" toml:"cache,omitempty" yaml:"cache,omitempty" export:"true"`
-	// ServiceName       string          `description:"Name of the Traefik service in Consul Catalog (needs to be registered via the orchestrator or manually)." json:"serviceName,omitempty" toml:"serviceName,omitempty" yaml:"serviceName,omitempty" export:"true"`
-	// Watch     bool   `description:"Watch Consul API events." json:"watch,omitempty" toml:"watch,omitempty" yaml:"watch,omitempty" export:"true"`
-
-	nClient        *api.Client        // Nomad API Client
-	defaultRuleTpl *template.Template // Default routing rule.
-	// watchServicesChan chan struct{}
+	nClient           *api.Client        // client for Nomad API
+	defaultRuleTpl    *template.Template // default routing rule
+	watchServicesChan chan struct{}      // poll notifications on notifications
 }
 
 type EndpointConfig struct {
@@ -81,11 +78,12 @@ func (p *Provider) SetDefaults() {
 	}
 	p.Prefix = defaultPrefix
 	p.ExposedByDefault = true
+	p.RefreshInterval = types2.Duration(15 * time.Second)
 	p.DefaultRule = defaultTemplateRule
 }
 
 // Init the Nomad Traefik Provider.
-func (p Provider) Init() error {
+func (p *Provider) Init() error {
 	defaultRuleTpl, err := provider.MakeDefaultRuleTemplate(p.DefaultRule, nil)
 	if err != nil {
 		return fmt.Errorf("error while parsing default rule: %w", err)
@@ -96,33 +94,59 @@ func (p Provider) Init() error {
 
 // Provide allows the Nomad Traefik Provider to provide configurations to traefik
 // using the given configuration channel.
-func (p Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.Pool) error {
+func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.Pool) error {
 	var err error
 	p.nClient, err = createClient(p.Namespace, p.Endpoint)
 	if err != nil {
 		return fmt.Errorf("failed to create nomad API client: %w", err)
 	}
 
-	//pool.GoCtx(func(routineCtx context.Context) {
-	//	ctxLog := log.With(routineCtx, log.Str(log.ProviderName, "nomad"))
-	//	logger := log.FromContext(ctxLog)
-	//
-	//	operation := func() error {
-	//		ctx, cancel := context.WithCancel(ctxLog)
-	//		defer cancel()
-	//
-	//		// load configuration
-	//
-	//		// periodic refreshes (Nomad does not support Watch style observations)
-	//		go func() {
-	//			// intervals(ctx, time.Duration(p.RefreshInterval))
-	//		}()
-	//
-	//		// selects
-	//		return nil
-	//	}
-	//
-	//})
+	pool.GoCtx(func(routineCtx context.Context) {
+		ctxLog := log.With(routineCtx, log.Str(log.ProviderName, providerName))
+		logger := log.FromContext(ctxLog)
+
+		operation := func() error {
+			ctx, cancel := context.WithCancel(ctxLog)
+			defer cancel()
+
+			// load initial configuration
+			if loadErr := p.loadConfiguration(ctx, configurationChan); loadErr != nil {
+				return fmt.Errorf("failed to load initial nomad services: %w", loadErr)
+			}
+
+			go func() {
+				// issue periodic refreshes in the background
+				// (Nomad does not support Watch style observations)
+				notifications(ctx, time.Duration(p.RefreshInterval), p.watchServicesChan)
+			}()
+
+			// enter loop where we wait for and respond to notifications
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-p.watchServicesChan:
+				}
+
+				// load services due to refresh
+				if loadErr := p.loadConfiguration(ctx, configurationChan); loadErr != nil {
+					return fmt.Errorf("failed to refresh nomad services: %w", loadErr)
+				}
+			}
+		}
+
+		failure := func(err error, d time.Duration) {
+			logger.Errorf("Provider connection error %+v, retrying in %s", err, d)
+		}
+
+		if retryErr := backoff.RetryNotify(
+			safe.OperationWithRecover(operation),
+			backoff.WithContext(job.NewBackOff(backoff.NewExponentialBackOff()), ctxLog),
+			failure,
+		); retryErr != nil {
+			logger.Errorf("Cannot connect to Nomad server %+v", retryErr)
+		}
+	})
 
 	return nil
 }
@@ -133,11 +157,9 @@ func (p *Provider) loadConfiguration(ctx context.Context, configurationC chan<- 
 		return err
 	}
 
-	_ = items
 	configurationC <- dynamic.Message{
-		ProviderName: providerName,
-		// YOU ARE HERE
-		// use p.buildConfiguration
+		ProviderName:  providerName,
+		Configuration: p.buildConfiguration(ctx, items),
 	}
 
 	return nil
@@ -171,8 +193,8 @@ func createClient(namespace string, endpoint *EndpointConfig) (*api.Client, erro
 	return api.NewClient(&config)
 }
 
-// intervals will send on c after each interval, until ctx is Done.
-func intervals(ctx context.Context, interval time.Duration, c chan<- struct{}) {
+// notifications will send on c after each interval, until ctx is Done.
+func notifications(ctx context.Context, interval time.Duration, c chan<- struct{}) {
 	ticket := time.NewTicker(interval)
 	defer ticket.Stop()
 
@@ -280,10 +302,10 @@ func (p *Provider) getNomadServiceData(ctx context.Context) ([]item, error) {
 func (p *Provider) fetchService(ctx context.Context, name string) ([]*api.ServiceRegistration, error) {
 	var tagFilter string
 	if !p.ExposedByDefault {
-		tagFilter = enableTag(p.Prefix)
+		tagFilter = fmt.Sprintf(`Tags contains %q`, enableTag(p.Prefix))
 	}
 
-	opts := &api.QueryOptions{AllowStale: p.Stale}
+	opts := &api.QueryOptions{AllowStale: p.Stale, Filter: tagFilter}
 	opts = opts.WithContext(ctx)
 
 	services, _, err := p.nClient.Services().Get(name, opts)
@@ -291,17 +313,5 @@ func (p *Provider) fetchService(ctx context.Context, name string) ([]*api.Servic
 		return nil, fmt.Errorf("failed to fetch services: %w", err)
 	}
 
-	// todo: Nomad currently (v1.3.0) does not support tag-filtering on service queries.
-	//  When it does, refactor this section to filter via Nomad API rather than
-	//  doing it by hand in here.
-	var active []*api.ServiceRegistration
-	for _, service := range services {
-		for _, tag := range service.Tags {
-			if tag == tagFilter {
-				active = append(active, service)
-			}
-		}
-	}
-
-	return active, nil
+	return services, nil
 }
