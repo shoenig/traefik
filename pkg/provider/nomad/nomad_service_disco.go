@@ -42,6 +42,8 @@ type item struct {
 	Address    string   // service address
 	Port       int      // service port
 	Tags       []string // service tags
+
+	ExtraConf configuration // global options
 }
 
 // Provider holds configurations of the provider.
@@ -159,7 +161,7 @@ func (p *Provider) loadConfiguration(ctx context.Context, configurationC chan<- 
 
 	configurationC <- dynamic.Message{
 		ProviderName:  providerName,
-		Configuration: p.buildConfiguration(ctx, items),
+		Configuration: p.buildConfig(ctx, items),
 	}
 
 	return nil
@@ -215,24 +217,20 @@ func notifications(ctx context.Context, interval time.Duration, c chan<- struct{
 	}
 }
 
-func enableTag(prefix string) string {
-	return fmt.Sprintf("%s.enable=true", prefix)
-}
-
 // configuration contains information from the service's tags that are globals
 // (not specific to the dynamic configuration).
 type configuration struct {
-	Enable bool
+	Enable bool // <prefix>.enable
 }
 
-func getConfiguration(tags []string, prefix string) configuration {
-	c := configuration{Enable: false}
-	enabled := enableTag(prefix)
-	for _, tag := range tags {
-		if tag == enabled {
-			c.Enable = true
-			break
-		}
+// globalConfig returns a configuration with settings not specific to a particular
+// dynamic configuration (i.e. "<prefix>.enable")
+func (p *Provider) globalConfig(tags []string) configuration {
+	c := configuration{Enable: p.ExposedByDefault}
+	labels := tagsToLabels(tags, p.Prefix)
+	if v, exists := labels["traefik.enable"]; exists {
+		c.Enable = v == "true"
+		fmt.Println("enable:", c.Enable, "v:", v)
 	}
 	return c
 }
@@ -253,8 +251,8 @@ func (p *Provider) getNomadServiceData(ctx context.Context) ([]item, error) {
 		for _, service := range stub.Services {
 			name, tags := service.ServiceName, service.Tags
 			logger := log.FromContext(log.With(ctx, log.Str("serviceName", name)))
-			cfg := getConfiguration(tags, p.Prefix)
-			if !cfg.Enable {
+			globalCfg := p.globalConfig(tags)
+			if !globalCfg.Enable {
 				logger.Debug("Filter Nomad service that is not enabled")
 				continue
 			}
@@ -285,12 +283,17 @@ func (p *Provider) getNomadServiceData(ctx context.Context) ([]item, error) {
 					Address:    i.Address,
 					Port:       i.Port,
 					Tags:       i.Tags,
+					ExtraConf:  p.globalConfig(i.Tags),
 				})
 			}
 		}
 	}
 
 	return items, nil
+}
+
+func enableTag(prefix string) string {
+	return fmt.Sprintf("%s.enable=true", prefix)
 }
 
 // fetchService queries Nomad API for services matching name, that also have the

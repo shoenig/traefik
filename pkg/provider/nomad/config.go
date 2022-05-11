@@ -12,20 +12,27 @@ import (
 	"github.com/traefik/traefik/v2/pkg/config/label"
 	"github.com/traefik/traefik/v2/pkg/log"
 	"github.com/traefik/traefik/v2/pkg/provider"
+	"github.com/traefik/traefik/v2/pkg/provider/constraints"
 )
 
-func (p *Provider) buildConfiguration(ctx context.Context, items []item) *dynamic.Configuration {
+func (p *Provider) buildConfig(ctx context.Context, items []item) *dynamic.Configuration {
 	configurations := make(map[string]*dynamic.Configuration)
 
 	for _, i := range items {
 		normalUnique := provider.Normalize(i.Node + "-" + i.Name + "-" + i.ID)
 		ctxSvc := log.With(ctx, log.Str(log.ServiceName, normalUnique))
+
+		if !p.keepItem(ctxSvc, i) {
+			fmt.Println("will not keep item:", i.ID)
+			continue
+		}
+
 		logger := log.FromContext(ctx)
 		labels := tagsToLabels(i.Tags, p.Prefix)
 
-		config, err := label.DecodeConfiguration(labels)
-		if err != nil {
-			logger.Error("failed to decode configuration: %v", err)
+		config, decErr := label.DecodeConfiguration(labels)
+		if decErr != nil {
+			logger.Errorf("failed to decode configuration: %v", decErr)
 			continue
 		}
 
@@ -34,7 +41,7 @@ func (p *Provider) buildConfiguration(ctx context.Context, items []item) *dynami
 		if len(config.TCP.Routers) > 0 || len(config.TCP.Services) > 0 {
 			tcpOrUDP = true
 			if buildErr := p.buildTCPConfig(i, config.TCP); buildErr != nil {
-				logger.Error("failed to build tcp service configuration: %v", err)
+				logger.Errorf("failed to build tcp service configuration: %v", buildErr)
 				continue
 			}
 			provider.BuildTCPRouterConfiguration(ctxSvc, config.TCP)
@@ -43,7 +50,7 @@ func (p *Provider) buildConfiguration(ctx context.Context, items []item) *dynami
 		if len(config.UDP.Routers) > 0 || len(config.UDP.Services) > 0 {
 			tcpOrUDP = true
 			if buildErr := p.buildUDPConfig(i, config.UDP); buildErr != nil {
-				logger.Error("failed to build udp service configuration: %v", err)
+				logger.Errorf("failed to build udp service configuration: %v", buildErr)
 				continue
 			}
 			provider.BuildUDPRouterConfiguration(ctxSvc, config.UDP)
@@ -58,8 +65,8 @@ func (p *Provider) buildConfiguration(ctx context.Context, items []item) *dynami
 		}
 
 		// configure http service
-		if buildErr := p.buildServiceConfiguration(i, config.HTTP); buildErr != nil {
-			logger.Error("failed to build http service configuration: %v", err)
+		if buildErr := p.buildServiceConfig(i, config.HTTP); buildErr != nil {
+			logger.Errorf("failed to build http service configuration: %v", buildErr)
 			continue
 		}
 
@@ -115,7 +122,7 @@ func (p *Provider) buildUDPConfig(i item, configuration *dynamic.UDPConfiguratio
 	return nil
 }
 
-func (p *Provider) buildServiceConfiguration(i item, configuration *dynamic.HTTPConfiguration) error {
+func (p *Provider) buildServiceConfig(i item, configuration *dynamic.HTTPConfiguration) error {
 	if len(configuration.Services) == 0 {
 		configuration.Services = make(map[string]*dynamic.Service)
 		lb := new(dynamic.ServersLoadBalancer)
@@ -132,6 +139,29 @@ func (p *Provider) buildServiceConfiguration(i item, configuration *dynamic.HTTP
 	}
 
 	return nil
+}
+
+func (p *Provider) keepItem(ctx context.Context, i item) bool {
+	logger := log.FromContext(ctx)
+
+	if !i.ExtraConf.Enable {
+		logger.Debug("Filtering disabled item")
+		return false
+	}
+
+	matches, err := constraints.MatchTags(i.Tags, p.Constraints)
+	if err != nil {
+		logger.Errorf("Error matching constraint expressions: %v", err)
+		return false
+	}
+	if !matches {
+		logger.Debugf("Filtering out item due to constraints: %q", p.Constraints)
+		return false
+	}
+
+	// filter on health when that information exists
+
+	return true
 }
 
 func (p *Provider) addServerTCP(i item, lb *dynamic.TCPServersLoadBalancer) error {
@@ -233,13 +263,13 @@ func (p *Provider) addServer(i item, lb *dynamic.ServersLoadBalancer) error {
 }
 
 func tagsToLabels(tags []string, prefix string) map[string]string {
-	labels := make(map[string]string, 0)
+	labels := make(map[string]string, len(tags))
 	for _, tag := range tags {
 		if strings.HasPrefix(tag, prefix) {
-			parts := strings.SplitN(tag, "=", 2)
-			if len(parts) == 2 {
-				key := "traefik" + strings.TrimPrefix(parts[0], prefix)
-				labels[key] = parts[1]
+			if parts := strings.SplitN(tag, "=", 2); len(parts) == 2 {
+				left, right := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+				key := "traefik" + strings.TrimPrefix(left, prefix)
+				labels[key] = right
 			}
 		}
 	}

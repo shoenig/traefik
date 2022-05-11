@@ -3,7 +3,6 @@ package provider
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -402,7 +401,6 @@ func BuildRouterConfiguration(ctx context.Context, configuration *dynamic.HTTPCo
 		loggerRouter := log.FromContext(ctx).WithField(log.RouterName, routerName)
 		if len(router.Rule) == 0 {
 			writer := &bytes.Buffer{}
-			fmt.Println("drt:", defaultRuleTpl)
 			if err := defaultRuleTpl.Execute(writer, model); err != nil {
 				loggerRouter.Errorf("Error while parsing default rule: %v", err)
 				delete(configuration.Routers, routerName)
