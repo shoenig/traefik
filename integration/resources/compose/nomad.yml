@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  nomad:
+    image: shoenig/nomad:v1.3.0
+    command: agent -dev -bind 0.0.0.0
+
+networks:
+  default:
+    name: traefik-test-network
+    external: true
