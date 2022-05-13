@@ -23,8 +23,8 @@ const (
 	// providerName is the name of this provider.
 	providerName = "nomad"
 
-	// defaultTemplateRule The default template for the default rule.
-	defaultTemplateRule = "Host(`{{ normalize .Name }}`)"
+	// DefaultTemplateRule The default template for the default rule.
+	DefaultTemplateRule = "Host(`{{ normalize .Name }}`)"
 
 	// defaultPrefix is the default prefix used in tag values indicating the service
 	// should be consumed and exposed via traefik.
@@ -81,7 +81,7 @@ func (p *Provider) SetDefaults() {
 	p.Prefix = defaultPrefix
 	p.ExposedByDefault = true
 	p.RefreshInterval = types2.Duration(15 * time.Second)
-	p.DefaultRule = defaultTemplateRule
+	p.DefaultRule = DefaultTemplateRule
 }
 
 // Init the Nomad Traefik Provider.

@@ -236,7 +236,7 @@ func Test_defaultRule(t *testing.T) {
 					ExtraConf: configuration{Enable: true},
 				},
 			},
-			rule: defaultTemplateRule,
+			rule: DefaultTemplateRule,
 			expected: &dynamic.Configuration{
 				TCP: &dynamic.TCPConfiguration{
 					Routers:     map[string]*dynamic.TCPRouter{},
