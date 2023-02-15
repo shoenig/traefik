@@ -604,7 +604,7 @@ func (p *Provider) resolveDefaultCertificate(ctx context.Context, domains []stri
 }
 
 func (p *Provider) resolveCertificate(ctx context.Context, domain types.Domain, tlsStore string) (types.Domain, *certificate.Resource, error) {
-	domains, err := p.sanitizeDomains(ctx, domain)
+    domains, err := p.sanitizeDomains(ctx, domain)
 	if err != nil {
 		return types.Domain{}, nil, err
 	}

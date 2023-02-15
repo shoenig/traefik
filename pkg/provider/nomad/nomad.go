@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"text/template"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/traefik/traefik/v2/pkg/provider/constraints"
 	"github.com/traefik/traefik/v2/pkg/safe"
 	"github.com/traefik/traefik/v2/pkg/types"
+	"github.com/traefik/traefik/v2/pkg/version"
 )
 
 const (
@@ -31,6 +33,11 @@ const (
 	// defaultPrefix is the default prefix used in tag values indicating the service
 	// should be consumed and exposed via traefik.
 	defaultPrefix = "traefik"
+
+	// envNomadToken is the environment variable in which the Nomad Workload
+	// Identity token will be set, in Nomad 1.5+ in tasks with an identity
+	// block enabled.
+	envNomadToken = "NOMAD_TOKEN"
 )
 
 var _ provider.Provider = (*Provider)(nil)
@@ -208,12 +215,29 @@ func (p *Provider) loadConfiguration(ctx context.Context, configurationC chan<- 
 }
 
 func createClient(namespace string, endpoint *EndpointConfig) (*api.Client, error) {
+	ua := fmt.Sprintf("Traefik %s", version.Version)
+
+	// detect if we are running as a Nomad Task and should make use of the Nomad
+	// Task API unix domain socket for communicating with Nomad. This is assumed
+	// to be the case if the endpoint address is empty, and we have a NOMAD_TOKEN
+	// environment variable set (as Nomad Workload Identity).
+	if endpoint.Address == "" && os.Getenv("NOMAD_TOKEN") != "" {
+		// we probably still want multi namespace?
+		// and what about region?: tbh not even sure why this is
+		// configurable ...
+		return api.TaskClient(func(c *api.Config) {
+			c.Namespace = namespace
+			c.Headers.Set("User-Agent", ua)
+		}), nil
+	}
+
 	config := api.Config{
 		Address:   endpoint.Address,
 		Namespace: namespace,
 		Region:    endpoint.Region,
 		SecretID:  endpoint.Token,
 		WaitTime:  time.Duration(endpoint.EndpointWaitTime),
+		Headers:   map[string][]string{"User-Agent": {ua}},
 	}
 
 	if endpoint.TLS != nil {

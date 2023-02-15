@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shoenig/netlog"
+
 	"github.com/coreos/go-systemd/daemon"
 	"github.com/go-acme/lego/v4/challenge"
 	gokitmetrics "github.com/go-kit/kit/metrics"
@@ -186,6 +188,7 @@ func setupServer(staticConfiguration *static.Configuration) (*server.Server, err
 		return nil, err
 	}
 
+	netlog.Yellow("initACMEProvider")
 	acmeProviders := initACMEProvider(staticConfiguration, &providerAggregator, tlsManager, httpChallengeProvider, tlsChallengeProvider)
 
 	// Tailscale
@@ -427,7 +430,11 @@ func switchRouter(routerFactory *server.RouterFactory, serverEntryPointsTCP serv
 
 // initACMEProvider creates and registers acme.Provider instances corresponding to the configured ACME certificate resolvers.
 func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.ProviderAggregator, tlsManager *traefiktls.Manager, httpChallengeProvider, tlsChallengeProvider challenge.Provider) []*acme.Provider {
-	localStores := map[string]*acme.LocalStore{}
+	localStores := make(map[string]*acme.LocalStore)
+
+	// Create a Store backed by Nomad Variables, but only if Traefik is running as
+	// a compatible Nomad Task.
+	nomadStore := acme.MaybeNewNomadStore()
 
 	var resolvers []*acme.Provider
 	for name, resolver := range c.CertificatesResolvers {
@@ -435,13 +442,20 @@ func initACMEProvider(c *static.Configuration, providerAggregator *aggregator.Pr
 			continue
 		}
 
-		if localStores[resolver.ACME.Storage] == nil {
+		var store acme.Store
+		switch {
+		case nomadStore != nil && strings.HasPrefix(resolver.ACME.Storage, "nomad://"):
+			store = nomadStore.SetResolver(name, resolver.ACME.Storage)
+		case localStores[resolver.ACME.Storage] == nil:
 			localStores[resolver.ACME.Storage] = acme.NewLocalStore(resolver.ACME.Storage)
+			fallthrough
+		default:
+			store = localStores[resolver.ACME.Storage]
 		}
 
 		p := &acme.Provider{
 			Configuration:         resolver.ACME,
-			Store:                 localStores[resolver.ACME.Storage],
+			Store:                 store,
 			ResolverName:          name,
 			HTTPChallengeProvider: httpChallengeProvider,
 			TLSChallengeProvider:  tlsChallengeProvider,
